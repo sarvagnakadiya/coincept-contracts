@@ -21,7 +21,8 @@ contract Coincept is ReentrancyGuard, Ownable {
         address creator;
         string ideaDescription;
         address voteToken;
-        uint256 endTime;
+        uint256 votingStartTime;
+        uint256 votingEndTime;
         bool winnerDeclared;
         address winner;
         uint256 winningBuild;
@@ -93,9 +94,15 @@ contract Coincept is ReentrancyGuard, Ownable {
 
     function createContest(
         string memory ideaDescription,
+        uint256 votingStartTime,
         uint256 votingDuration,
+        address creator,
         IClanker.DeploymentConfig memory config
     ) external returns (uint256 contestId) {
+        require(
+            votingStartTime >= block.timestamp,
+            "Start time must be in future"
+        );
         (address token, uint256 positionId) = IClanker(clanker).deployToken{
             value: 0
         }(config);
@@ -103,18 +110,19 @@ contract Coincept is ReentrancyGuard, Ownable {
         contestId = contestCount++;
 
         Contest storage c = contests[contestId];
-        c.creator = msg.sender;
+        c.creator = creator;
         c.ideaDescription = ideaDescription;
         c.voteToken = token;
-        c.endTime = block.timestamp + votingDuration;
+        c.votingStartTime = votingStartTime;
+        c.votingEndTime = votingStartTime + votingDuration;
         c.positionId = positionId;
         c.contestToken = token;
 
-        userContests[msg.sender].push(contestId);
+        userContests[creator].push(contestId);
 
         emit ContestCreated(
             contestId,
-            msg.sender,
+            creator,
             token,
             positionId,
             ideaDescription
@@ -122,7 +130,14 @@ contract Coincept is ReentrancyGuard, Ownable {
     }
 
     function submitBuild(uint256 contestId, string memory buildLink) external {
-        require(block.timestamp < contests[contestId].endTime, "Voting ended");
+        require(
+            block.timestamp < contests[contestId].votingEndTime,
+            "Voting ended"
+        );
+        require(
+            block.timestamp >= contests[contestId].votingStartTime,
+            "Voting not started"
+        );
         Contest storage c = contests[contestId];
 
         c.builds.push(Build(msg.sender, buildLink, 0));
@@ -135,7 +150,8 @@ contract Coincept is ReentrancyGuard, Ownable {
 
     function vote(uint256 contestId, uint256 buildIndex) external {
         Contest storage c = contests[contestId];
-        require(block.timestamp < c.endTime, "Voting ended");
+        require(block.timestamp < c.votingEndTime, "Voting ended");
+        require(block.timestamp >= c.votingStartTime, "Voting not started");
         require(!hasVoted[contestId][msg.sender], "Already voted");
 
         uint256 votingPower = IVotes(c.voteToken).getVotes(msg.sender);
@@ -149,7 +165,7 @@ contract Coincept is ReentrancyGuard, Ownable {
 
     function pickWinner(uint256 contestId) public {
         Contest storage c = contests[contestId];
-        require(block.timestamp >= c.endTime, "Voting still active");
+        require(block.timestamp >= c.votingEndTime, "Voting still active");
         require(!c.winnerDeclared, "Winner already picked");
 
         uint256 maxVotes = 0;
@@ -172,7 +188,7 @@ contract Coincept is ReentrancyGuard, Ownable {
 
     function claimRewards(uint256 contestId) external nonReentrant {
         Contest storage c = contests[contestId];
-        require(block.timestamp >= c.endTime, "Voting still active");
+        require(block.timestamp >= c.votingEndTime, "Voting still active");
 
         if (!c.winnerDeclared) {
             pickWinner(contestId);
@@ -289,12 +305,20 @@ contract Coincept is ReentrancyGuard, Ownable {
             address creator,
             string memory idea,
             address voteToken,
-            uint256 endTime,
+            uint256 votingStartTime,
+            uint256 votingEndTime,
             address winner
         )
     {
         Contest storage c = contests[contestId];
-        return (c.creator, c.ideaDescription, c.voteToken, c.endTime, c.winner);
+        return (
+            c.creator,
+            c.ideaDescription,
+            c.voteToken,
+            c.votingStartTime,
+            c.votingEndTime,
+            c.winner
+        );
     }
 
     function getBuildCount(uint256 contestId) external view returns (uint256) {
