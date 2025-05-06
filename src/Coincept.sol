@@ -2,129 +2,302 @@
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/governance/utils/IVotes.sol";
 import "./Interfaces/IClanker.sol";
 import "./Interfaces/IPositionManager.sol";
 import "./Interfaces/ILPLocker.sol";
+import "./Interfaces/IClankerVault.sol";
 
-contract Coincept {
+contract Coincept is ReentrancyGuard, Ownable {
     struct Build {
         address author;
         string buildLink;
         uint256 voteCount;
     }
 
-    IVotes public voteToken;
-    uint256 public endTime;
-    bool public winnerDeclared;
-    bool public rewardClaimed;
+    struct Contest {
+        address creator;
+        string ideaDescription;
+        address voteToken;
+        uint256 endTime;
+        bool winnerDeclared;
+        address winner;
+        uint256 winningBuild;
+        uint256 positionId;
+        address contestToken;
+        Build[] builds;
+    }
 
-    address public winner;
-    uint256 public winningBuild;
-    address public creator;
+    struct BuildInfo {
+        uint256 contestId;
+        uint256 buildIndex;
+    }
 
-    string public ideaDescription;
-    Build[] public builds;
+    uint256 public contestCount;
 
-    mapping(address => bool) public hasVoted;
+    // Core storage
+    mapping(uint256 => Contest) public contests;
+    mapping(uint256 => mapping(address => bool)) public hasVoted;
 
-    // External dependencies
-    address public clankerContract;
-    uint256 public positionId;
-    address constant lpLocker = 0x33e2Eda238edcF470309b8c6D228986A1204c8f9;
-    address constant positionManager =
+    // Indexing for efficient queries
+    mapping(address => uint256[]) public userContests; // contests created by user
+    mapping(address => BuildInfo[]) public userBuilds; // builds submitted by user
+
+    // External contracts
+    address public clanker;
+    address public vault;
+    address public constant lpLocker =
+        0x33e2Eda238edcF470309b8c6D228986A1204c8f9;
+    address public constant positionManager =
         0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1;
 
-    constructor(
-        address _token,
-        uint256 _duration,
-        string memory _ideaDescription,
-        address _clanker,
-        uint256 _positionId
-    ) {
-        voteToken = IVotes(_token);
-        endTime = block.timestamp + _duration;
-        creator = msg.sender;
-        ideaDescription = _ideaDescription;
-        clankerContract = _clanker;
-        positionId = _positionId;
+    event ContestCreated(
+        uint256 indexed contestId,
+        address indexed creator,
+        address token,
+        uint256 positionId,
+        string idea
+    );
+    event BuildSubmitted(
+        uint256 indexed contestId,
+        uint256 indexed buildIndex,
+        address author
+    );
+    event Voted(
+        uint256 indexed contestId,
+        uint256 indexed buildIndex,
+        address voter,
+        uint256 weight
+    );
+    event WinnerDeclared(
+        uint256 indexed contestId,
+        address winner,
+        uint256 buildIndex
+    );
+    event RewardsClaimed(
+        uint256 indexed contestId,
+        address creator,
+        address winner,
+        address token0,
+        uint256 amount0,
+        address token1,
+        uint256 amount1
+    );
+
+    constructor(address _clanker, address _vault) Ownable(msg.sender) {
+        clanker = _clanker;
+        vault = _vault;
     }
 
-    function submitBuild(string memory buildLink) external {
-        require(block.timestamp < endTime, "Voting has ended");
-        builds.push(Build(msg.sender, buildLink, 0));
+    function createContest(
+        string memory ideaDescription,
+        uint256 votingDuration,
+        IClanker.DeploymentConfig memory config
+    ) external returns (uint256 contestId) {
+        (address token, uint256 positionId) = IClanker(clanker).deployToken{
+            value: 0
+        }(config);
+
+        contestId = contestCount++;
+
+        Contest storage c = contests[contestId];
+        c.creator = msg.sender;
+        c.ideaDescription = ideaDescription;
+        c.voteToken = token;
+        c.endTime = block.timestamp + votingDuration;
+        c.positionId = positionId;
+        c.contestToken = token;
+
+        userContests[msg.sender].push(contestId);
+
+        emit ContestCreated(
+            contestId,
+            msg.sender,
+            token,
+            positionId,
+            ideaDescription
+        );
     }
 
-    function vote(uint256 buildIndex) external {
-        require(block.timestamp < endTime, "Voting has ended");
-        require(!hasVoted[msg.sender], "Already voted");
+    function submitBuild(uint256 contestId, string memory buildLink) external {
+        require(block.timestamp < contests[contestId].endTime, "Voting ended");
+        Contest storage c = contests[contestId];
 
-        uint256 votingPower = voteToken.getVotes(msg.sender);
+        c.builds.push(Build(msg.sender, buildLink, 0));
+        uint256 buildIndex = c.builds.length - 1;
+
+        userBuilds[msg.sender].push(BuildInfo(contestId, buildIndex));
+
+        emit BuildSubmitted(contestId, buildIndex, msg.sender);
+    }
+
+    function vote(uint256 contestId, uint256 buildIndex) external {
+        Contest storage c = contests[contestId];
+        require(block.timestamp < c.endTime, "Voting ended");
+        require(!hasVoted[contestId][msg.sender], "Already voted");
+
+        uint256 votingPower = IVotes(c.voteToken).getVotes(msg.sender);
         require(votingPower > 0, "No voting power");
 
-        builds[buildIndex].voteCount += votingPower;
-        hasVoted[msg.sender] = true;
+        c.builds[buildIndex].voteCount += votingPower;
+        hasVoted[contestId][msg.sender] = true;
+
+        emit Voted(contestId, buildIndex, msg.sender, votingPower);
     }
 
-    function pickWinner() public {
-        require(block.timestamp >= endTime, "Voting still active");
-        require(!winnerDeclared, "Winner already picked");
+    function pickWinner(uint256 contestId) public {
+        Contest storage c = contests[contestId];
+        require(block.timestamp >= c.endTime, "Voting still active");
+        require(!c.winnerDeclared, "Winner already picked");
 
-        uint256 highestVotes = 0;
-        for (uint256 i = 0; i < builds.length; i++) {
-            if (builds[i].voteCount > highestVotes) {
-                highestVotes = builds[i].voteCount;
-                winner = builds[i].author;
-                winningBuild = i;
+        uint256 maxVotes = 0;
+        uint256 winningIndex = 0;
+
+        for (uint256 i = 0; i < c.builds.length; i++) {
+            uint256 votes = c.builds[i].voteCount;
+            if (votes > maxVotes) {
+                maxVotes = votes;
+                winningIndex = i;
             }
         }
 
-        winnerDeclared = true;
+        c.winner = c.builds[winningIndex].author;
+        c.winningBuild = winningIndex;
+        c.winnerDeclared = true;
+
+        emit WinnerDeclared(contestId, c.winner, winningIndex);
     }
 
-    function claimRewards() external {
-        require(block.timestamp >= endTime, "Voting still active");
-        require(!rewardClaimed, "Already claimed");
+    function claimRewards(uint256 contestId) external nonReentrant {
+        Contest storage c = contests[contestId];
+        require(block.timestamp >= c.endTime, "Voting still active");
 
-        if (!winnerDeclared) {
-            pickWinner();
+        if (!c.winnerDeclared) {
+            pickWinner(contestId);
         }
 
-        // Collect rewards from LP locker
         (uint256 amount0, uint256 amount1) = ILPLocker(lpLocker).collectRewards(
-            positionId
+            c.positionId
         );
 
-        // Get the token address (token0 or token1 should match voteToken)
         (, , address token0, address token1, , , , , , , , ) = IPositionManager(
             positionManager
-        ).positions(positionId);
+        ).positions(c.positionId);
 
-        address rewardToken;
-        uint256 amount;
-        if (token0 == address(voteToken)) {
-            rewardToken = token0;
-            amount = amount0;
-        } else if (token1 == address(voteToken)) {
-            rewardToken = token1;
-            amount = amount1;
-        } else {
-            revert("Reward token not found in position");
+        // --- Handle token0 rewards ---
+        if (amount0 > 0) {
+            uint256 toCreator0 = (amount0 * 10) / 100;
+            uint256 toWinner0 = amount0 - toCreator0;
+
+            require(
+                IERC20(token0).transfer(c.creator, toCreator0),
+                "token0: transfer to creator failed"
+            );
+            require(
+                IERC20(token0).transfer(c.winner, toWinner0),
+                "token0: transfer to winner failed"
+            );
         }
 
-        require(amount > 0, "No rewards to claim");
+        // --- Handle token1 rewards ---
+        if (amount1 > 0) {
+            uint256 toCreator1 = (amount1 * 10) / 100;
+            uint256 toWinner1 = amount1 - toCreator1;
 
-        // Split: 10% to idea poster, 90% to winning builder
-        uint256 toCreator = (amount * 10) / 100;
-        uint256 toBuilder = amount - toCreator;
+            require(
+                IERC20(token1).transfer(c.creator, toCreator1),
+                "token1: transfer to creator failed"
+            );
+            require(
+                IERC20(token1).transfer(c.winner, toWinner1),
+                "token1: transfer to winner failed"
+            );
+        }
 
-        IERC20(rewardToken).transfer(creator, toCreator);
-        IERC20(rewardToken).transfer(winner, toBuilder);
-
-        rewardClaimed = true;
+        emit RewardsClaimed(
+            contestId,
+            c.creator,
+            c.winner,
+            token0,
+            amount0,
+            token1,
+            amount1
+        );
     }
 
-    function getBuildCount() external view returns (uint256) {
-        return builds.length;
+    function transferVaultAdminToWinner(uint256 contestId) external {
+        Contest storage c = contests[contestId];
+
+        require(c.winnerDeclared, "Winner not picked");
+
+        // Transfer admin rights of voteToken in the global vault to the winner
+        IClankerVault(vault).editAllocationAdmin(c.voteToken, c.winner);
+    }
+
+    // ---------------- admin Functions ----------------
+    function updateClanker(address newClanker) external onlyOwner {
+        require(newClanker != address(0), "Invalid address");
+        clanker = newClanker;
+    }
+
+    function updateVault(address newVault) external onlyOwner {
+        require(newVault != address(0), "Invalid address");
+        vault = newVault;
+    }
+    // ---------------- View Functions ----------------
+
+    function getContestsByUser(
+        address user
+    ) external view returns (uint256[] memory) {
+        return userContests[user];
+    }
+
+    function getBuildsByUser(
+        address user
+    ) external view returns (BuildInfo[] memory) {
+        return userBuilds[user];
+    }
+
+    function getDetailedBuildsByUser(
+        address user
+    ) external view returns (Build[] memory) {
+        BuildInfo[] memory infoArr = userBuilds[user];
+        Build[] memory result = new Build[](infoArr.length);
+
+        for (uint256 i = 0; i < infoArr.length; i++) {
+            BuildInfo memory info = infoArr[i];
+            result[i] = contests[info.contestId].builds[info.buildIndex];
+        }
+
+        return result;
+    }
+
+    function getBuilds(
+        uint256 contestId
+    ) external view returns (Build[] memory) {
+        return contests[contestId].builds;
+    }
+
+    function getContestMetadata(
+        uint256 contestId
+    )
+        external
+        view
+        returns (
+            address creator,
+            string memory idea,
+            address voteToken,
+            uint256 endTime,
+            address winner
+        )
+    {
+        Contest storage c = contests[contestId];
+        return (c.creator, c.ideaDescription, c.voteToken, c.endTime, c.winner);
+    }
+
+    function getBuildCount(uint256 contestId) external view returns (uint256) {
+        return contests[contestId].builds.length;
     }
 }
