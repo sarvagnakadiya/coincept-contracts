@@ -2,6 +2,7 @@
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/governance/utils/IVotes.sol";
@@ -11,6 +12,7 @@ import "./Interfaces/ILPLocker.sol";
 import "./Interfaces/IClankerVault.sol";
 
 contract Coincept is ReentrancyGuard, Ownable {
+    using SafeERC20 for IERC20;
     struct Build {
         address author;
         string buildLink;
@@ -27,7 +29,7 @@ contract Coincept is ReentrancyGuard, Ownable {
         address winner;
         uint256 winningBuild;
         uint256 positionId;
-        address contestToken;
+        string castHash;
         Build[] builds;
     }
 
@@ -97,6 +99,7 @@ contract Coincept is ReentrancyGuard, Ownable {
         uint256 votingStartTime,
         uint256 votingDuration,
         address creator,
+        string memory castHash,
         IClanker.DeploymentConfig memory config
     ) external returns (uint256 contestId) {
         require(
@@ -116,7 +119,7 @@ contract Coincept is ReentrancyGuard, Ownable {
         c.votingStartTime = votingStartTime;
         c.votingEndTime = votingStartTime + votingDuration;
         c.positionId = positionId;
-        c.contestToken = token;
+        c.castHash = castHash;
 
         userContests[creator].push(contestId);
 
@@ -133,10 +136,6 @@ contract Coincept is ReentrancyGuard, Ownable {
         require(
             block.timestamp < contests[contestId].votingEndTime,
             "Voting ended"
-        );
-        require(
-            block.timestamp >= contests[contestId].votingStartTime,
-            "Voting not started"
         );
         Contest storage c = contests[contestId];
 
@@ -194,42 +193,40 @@ contract Coincept is ReentrancyGuard, Ownable {
             pickWinner(contestId);
         }
 
-        (uint256 amount0, uint256 amount1) = ILPLocker(lpLocker).collectRewards(
-            c.positionId
-        );
-
         (, , address token0, address token1, , , , , , , , ) = IPositionManager(
             positionManager
         ).positions(c.positionId);
 
-        // --- Handle token0 rewards ---
+        // Snapshot balances before claiming
+        uint256 bal0Before = IERC20(token0).balanceOf(address(this));
+        uint256 bal1Before = IERC20(token1).balanceOf(address(this));
+
+        // Collect rewards — no return value
+        ILPLocker(lpLocker).collectRewards(c.positionId);
+
+        // Snapshot balances after
+        uint256 bal0After = IERC20(token0).balanceOf(address(this));
+        uint256 bal1After = IERC20(token1).balanceOf(address(this));
+
+        uint256 amount0 = bal0After - bal0Before;
+        uint256 amount1 = bal1After - bal1Before;
+
+        // --- Handle token0 ---
         if (amount0 > 0) {
             uint256 toCreator0 = (amount0 * 10) / 100;
             uint256 toWinner0 = amount0 - toCreator0;
 
-            require(
-                IERC20(token0).transfer(c.creator, toCreator0),
-                "token0: transfer to creator failed"
-            );
-            require(
-                IERC20(token0).transfer(c.winner, toWinner0),
-                "token0: transfer to winner failed"
-            );
+            IERC20(token0).safeTransfer(c.creator, toCreator0);
+            IERC20(token0).safeTransfer(c.winner, toWinner0);
         }
 
-        // --- Handle token1 rewards ---
+        // --- Handle token1 ---
         if (amount1 > 0) {
             uint256 toCreator1 = (amount1 * 10) / 100;
             uint256 toWinner1 = amount1 - toCreator1;
 
-            require(
-                IERC20(token1).transfer(c.creator, toCreator1),
-                "token1: transfer to creator failed"
-            );
-            require(
-                IERC20(token1).transfer(c.winner, toWinner1),
-                "token1: transfer to winner failed"
-            );
+            IERC20(token1).safeTransfer(c.creator, toCreator1);
+            IERC20(token1).safeTransfer(c.winner, toWinner1);
         }
 
         emit RewardsClaimed(
@@ -262,6 +259,16 @@ contract Coincept is ReentrancyGuard, Ownable {
         require(newVault != address(0), "Invalid address");
         vault = newVault;
     }
+
+    function withdrawERC20(
+        address token,
+        uint256 amount,
+        address recipient
+    ) external onlyOwner {
+        require(token != address(0), "Invalid token address");
+        IERC20(token).safeTransfer(recipient, amount);
+    }
+
     // ---------------- View Functions ----------------
 
     function getContestsByUser(
@@ -298,27 +305,8 @@ contract Coincept is ReentrancyGuard, Ownable {
 
     function getContestMetadata(
         uint256 contestId
-    )
-        external
-        view
-        returns (
-            address creator,
-            string memory idea,
-            address voteToken,
-            uint256 votingStartTime,
-            uint256 votingEndTime,
-            address winner
-        )
-    {
-        Contest storage c = contests[contestId];
-        return (
-            c.creator,
-            c.ideaDescription,
-            c.voteToken,
-            c.votingStartTime,
-            c.votingEndTime,
-            c.winner
-        );
+    ) external view returns (Contest memory) {
+        return contests[contestId];
     }
 
     function getBuildCount(uint256 contestId) external view returns (uint256) {
