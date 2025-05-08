@@ -42,7 +42,11 @@ contract Coincept is ReentrancyGuard, Ownable {
 
     // Core storage
     mapping(uint256 => Contest) public contests;
-    mapping(uint256 => mapping(address => bool)) public hasVoted;
+    // mapping(uint256 => mapping(address => bool)) public hasVoted;
+    // Maps contestId => voter => buildIndex they voted for
+    mapping(uint256 => mapping(address => uint256)) public votedBuildIndex;
+    // Maps contestId => voter => voting power used
+    mapping(uint256 => mapping(address => uint256)) public votingPowerUsed;
 
     // Indexing for efficient queries
     mapping(address => uint256[]) public userContests; // contests created by user
@@ -151,13 +155,15 @@ contract Coincept is ReentrancyGuard, Ownable {
         Contest storage c = contests[contestId];
         require(block.timestamp < c.votingEndTime, "Voting ended");
         require(block.timestamp >= c.votingStartTime, "Voting not started");
-        require(!hasVoted[contestId][msg.sender], "Already voted");
+        // require(!hasVoted[contestId][msg.sender], "Already voted");
 
         uint256 votingPower = IVotes(c.voteToken).getVotes(msg.sender);
         require(votingPower > 0, "No voting power");
 
         c.builds[buildIndex].voteCount += votingPower;
-        hasVoted[contestId][msg.sender] = true;
+        votedBuildIndex[contestId][msg.sender] = buildIndex;
+        votingPowerUsed[contestId][msg.sender] = votingPower;
+        // hasVoted[contestId][msg.sender] = true;
 
         emit Voted(contestId, buildIndex, msg.sender, votingPower);
     }
@@ -311,5 +317,13 @@ contract Coincept is ReentrancyGuard, Ownable {
 
     function getBuildCount(uint256 contestId) external view returns (uint256) {
         return contests[contestId].builds.length;
+    }
+
+    function getVotingInfo(
+        uint256 contestId,
+        address voter
+    ) external view returns (uint256 buildIndex, uint256 votingPower) {
+        buildIndex = votedBuildIndex[contestId][voter];
+        votingPower = votingPowerUsed[contestId][voter];
     }
 }
