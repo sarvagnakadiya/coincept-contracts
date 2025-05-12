@@ -6,53 +6,19 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/governance/utils/IVotes.sol";
-import "./Interfaces/IClanker.sol";
-import "./Interfaces/IPositionManager.sol";
-import "./Interfaces/ILPLocker.sol";
-import "./Interfaces/IClankerVault.sol";
 
-contract Coincept is ReentrancyGuard, Ownable {
+import "./Interfaces/ICoincept.sol";
+
+contract Coincept is ICoincept, ReentrancyGuard, Ownable {
     using SafeERC20 for IERC20;
-    struct Build {
-        address author;
-        string buildLink;
-        uint256 voteCount;
-    }
-
-    struct Contest {
-        address creator;
-        string ideaDescription;
-        address voteToken;
-        uint256 votingStartTime;
-        uint256 votingEndTime;
-        bool winnerDeclared;
-        address winner;
-        uint256 winningBuild;
-        uint256 positionId;
-        string castHash;
-        Build[] builds;
-    }
-
-    struct BuildInfo {
-        uint256 contestId;
-        uint256 buildIndex;
-    }
 
     uint256 public contestCount;
-
-    // Core storage
+    mapping(address => bool) public admins;
     mapping(uint256 => Contest) public contests;
-    // mapping(uint256 => mapping(address => bool)) public hasVoted;
-    // Maps contestId => voter => buildIndex they voted for
     mapping(uint256 => mapping(address => uint256)) public votedBuildIndex;
-    // Maps contestId => voter => voting power used
     mapping(uint256 => mapping(address => uint256)) public votingPowerUsed;
-
-    // Indexing for efficient queries
-    mapping(address => uint256[]) public userContests; // contests created by user
-    mapping(address => BuildInfo[]) public userBuilds; // builds submitted by user
-
-    // External contracts
+    mapping(address => uint256[]) public userContests;
+    mapping(address => BuildInfo[]) public userBuilds;
     address public clanker;
     address public vault;
     address public constant lpLocker =
@@ -60,42 +26,9 @@ contract Coincept is ReentrancyGuard, Ownable {
     address public constant positionManager =
         0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1;
 
-    event ContestCreated(
-        uint256 indexed contestId,
-        address indexed creator,
-        address token,
-        uint256 positionId,
-        string idea
-    );
-    event BuildSubmitted(
-        uint256 indexed contestId,
-        uint256 indexed buildIndex,
-        address author
-    );
-    event Voted(
-        uint256 indexed contestId,
-        uint256 indexed buildIndex,
-        address voter,
-        uint256 weight
-    );
-    event WinnerDeclared(
-        uint256 indexed contestId,
-        address winner,
-        uint256 buildIndex
-    );
-    event RewardsClaimed(
-        uint256 indexed contestId,
-        address creator,
-        address winner,
-        address token0,
-        uint256 amount0,
-        address token1,
-        uint256 amount1
-    );
-
-    constructor(address _clanker, address _vault) Ownable(msg.sender) {
-        clanker = _clanker;
-        vault = _vault;
+    constructor(address clanker_, address vault_) Ownable(msg.sender) {
+        clanker = clanker_;
+        vault = vault_;
     }
 
     function createContest(
@@ -105,11 +38,9 @@ contract Coincept is ReentrancyGuard, Ownable {
         address creator,
         string memory castHash,
         IClanker.DeploymentConfig memory config
-    ) external returns (uint256 contestId) {
-        require(
-            votingStartTime >= block.timestamp,
-            "Start time must be in future"
-        );
+    ) external override returns (uint256 contestId) {
+        if (!admins[msg.sender]) revert Unauthorized();
+        if (votingStartTime < block.timestamp) revert InvalidStartTime();
         (address token, uint256 positionId) = IClanker(clanker).deployToken{
             value: 0
         }(config);
@@ -136,11 +67,12 @@ contract Coincept is ReentrancyGuard, Ownable {
         );
     }
 
-    function submitBuild(uint256 contestId, string memory buildLink) external {
-        require(
-            block.timestamp < contests[contestId].votingEndTime,
-            "Voting ended"
-        );
+    function submitBuild(
+        uint256 contestId,
+        string memory buildLink
+    ) external override {
+        if (block.timestamp >= contests[contestId].votingEndTime)
+            revert VotingEnded();
         Contest storage c = contests[contestId];
 
         c.builds.push(Build(msg.sender, buildLink, 0));
@@ -151,27 +83,25 @@ contract Coincept is ReentrancyGuard, Ownable {
         emit BuildSubmitted(contestId, buildIndex, msg.sender);
     }
 
-    function vote(uint256 contestId, uint256 buildIndex) external {
+    function vote(uint256 contestId, uint256 buildIndex) external override {
         Contest storage c = contests[contestId];
-        require(block.timestamp < c.votingEndTime, "Voting ended");
-        require(block.timestamp >= c.votingStartTime, "Voting not started");
-        // require(!hasVoted[contestId][msg.sender], "Already voted");
+        if (block.timestamp >= c.votingEndTime) revert VotingEnded();
+        if (block.timestamp < c.votingStartTime) revert VotingNotStarted();
 
         uint256 votingPower = IVotes(c.voteToken).getVotes(msg.sender);
-        require(votingPower > 0, "No voting power");
+        if (votingPower == 0) revert NoVotingPower();
 
         c.builds[buildIndex].voteCount += votingPower;
         votedBuildIndex[contestId][msg.sender] = buildIndex;
         votingPowerUsed[contestId][msg.sender] = votingPower;
-        // hasVoted[contestId][msg.sender] = true;
 
         emit Voted(contestId, buildIndex, msg.sender, votingPower);
     }
 
-    function pickWinner(uint256 contestId) public {
+    function pickWinner(uint256 contestId) public override {
         Contest storage c = contests[contestId];
-        require(block.timestamp >= c.votingEndTime, "Voting still active");
-        require(!c.winnerDeclared, "Winner already picked");
+        if (block.timestamp < c.votingEndTime) revert VotingEnded();
+        if (c.winnerDeclared) revert WinnerAlreadyPicked();
 
         uint256 maxVotes = 0;
         uint256 winningIndex = 0;
@@ -191,9 +121,9 @@ contract Coincept is ReentrancyGuard, Ownable {
         emit WinnerDeclared(contestId, c.winner, winningIndex);
     }
 
-    function claimRewards(uint256 contestId) external nonReentrant {
+    function claimRewards(uint256 contestId) external override nonReentrant {
         Contest storage c = contests[contestId];
-        require(block.timestamp >= c.votingEndTime, "Voting still active");
+        if (block.timestamp < c.votingEndTime) revert VotingEnded();
 
         if (!c.winnerDeclared) {
             pickWinner(contestId);
@@ -246,23 +176,29 @@ contract Coincept is ReentrancyGuard, Ownable {
         );
     }
 
-    function transferVaultAdminToWinner(uint256 contestId) external {
+    function transferVaultAdminToWinner(uint256 contestId) external override {
         Contest storage c = contests[contestId];
 
-        require(c.winnerDeclared, "Winner not picked");
+        if (!c.winnerDeclared) revert WinnerAlreadyPicked();
 
         // Transfer admin rights of voteToken in the global vault to the winner
         IClankerVault(vault).editAllocationAdmin(c.voteToken, c.winner);
     }
 
     // ---------------- admin Functions ----------------
-    function updateClanker(address newClanker) external onlyOwner {
-        require(newClanker != address(0), "Invalid address");
+
+    function setAdmin(address admin, bool isAdmin) external override onlyOwner {
+        admins[admin] = isAdmin;
+        emit SetAdmin(admin, isAdmin);
+    }
+
+    function updateClanker(address newClanker) external override onlyOwner {
+        if (newClanker == address(0)) revert InvalidAddress();
         clanker = newClanker;
     }
 
-    function updateVault(address newVault) external onlyOwner {
-        require(newVault != address(0), "Invalid address");
+    function updateVault(address newVault) external override onlyOwner {
+        if (newVault == address(0)) revert InvalidAddress();
         vault = newVault;
     }
 
@@ -270,8 +206,8 @@ contract Coincept is ReentrancyGuard, Ownable {
         address token,
         uint256 amount,
         address recipient
-    ) external onlyOwner {
-        require(token != address(0), "Invalid token address");
+    ) external override onlyOwner {
+        if (token == address(0)) revert InvalidTokenAddress();
         IERC20(token).safeTransfer(recipient, amount);
     }
 
@@ -279,19 +215,19 @@ contract Coincept is ReentrancyGuard, Ownable {
 
     function getContestsByUser(
         address user
-    ) external view returns (uint256[] memory) {
+    ) external view override returns (uint256[] memory) {
         return userContests[user];
     }
 
     function getBuildsByUser(
         address user
-    ) external view returns (BuildInfo[] memory) {
+    ) external view override returns (BuildInfo[] memory) {
         return userBuilds[user];
     }
 
     function getDetailedBuildsByUser(
         address user
-    ) external view returns (Build[] memory) {
+    ) external view override returns (Build[] memory) {
         BuildInfo[] memory infoArr = userBuilds[user];
         Build[] memory result = new Build[](infoArr.length);
 
@@ -305,24 +241,26 @@ contract Coincept is ReentrancyGuard, Ownable {
 
     function getBuilds(
         uint256 contestId
-    ) external view returns (Build[] memory) {
+    ) external view override returns (Build[] memory) {
         return contests[contestId].builds;
     }
 
     function getContestMetadata(
         uint256 contestId
-    ) external view returns (Contest memory) {
+    ) external view override returns (Contest memory) {
         return contests[contestId];
     }
 
-    function getBuildCount(uint256 contestId) external view returns (uint256) {
+    function getBuildCount(
+        uint256 contestId
+    ) external view override returns (uint256) {
         return contests[contestId].builds.length;
     }
 
     function getVotingInfo(
         uint256 contestId,
         address voter
-    ) external view returns (uint256 buildIndex, uint256 votingPower) {
+    ) external view override returns (uint256 buildIndex, uint256 votingPower) {
         buildIndex = votedBuildIndex[contestId][voter];
         votingPower = votingPowerUsed[contestId][voter];
     }
