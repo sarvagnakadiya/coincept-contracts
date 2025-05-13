@@ -91,6 +91,16 @@ contract Coincept is ICoincept, ReentrancyGuard, Ownable {
         uint256 votingPower = IVotes(c.voteToken).getVotes(msg.sender);
         if (votingPower == 0) revert NoVotingPower();
 
+        // Get previous voting info
+        uint256 previousBuildIndex = votedBuildIndex[contestId][msg.sender];
+        uint256 previousVotingPower = votingPowerUsed[contestId][msg.sender];
+
+        // If user has voted before, subtract their previous votes
+        if (previousVotingPower > 0) {
+            c.builds[previousBuildIndex].voteCount -= previousVotingPower;
+        }
+
+        // Add new votes
         c.builds[buildIndex].voteCount += votingPower;
         votedBuildIndex[contestId][msg.sender] = buildIndex;
         votingPowerUsed[contestId][msg.sender] = votingPower;
